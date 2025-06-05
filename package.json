@@ -1,0 +1,31 @@
+{
+  "name": "github-service-analyzer",
+  "version": "1.0.0",
+  "description": "A tool to analyze service dependencies across GitHub repositories",
+  "main": "dist/Tracker.js",
+  "types": "dist/Tracker.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node Tracker.ts",
+    "dev": "ts-node-dev --respawn Tracker.ts",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@octokit/rest": "^19.0.7",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/js-yaml": "^4.0.5",
+    "@types/node": "^20.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.3.4",
+    "ts-node": "^10.9.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "license": "MIT"
+}

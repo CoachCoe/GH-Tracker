@@ -1,15 +1,14 @@
-
 import { Octokit } from '@octokit/rest';
 import * as yaml from 'js-yaml';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-// Types for our dependency analysis
+
 interface ServiceDependency {
-  consumer: string; // repository name
-  producer: string; // service name or repository
+  consumer: string; 
+  producer: string; 
   type: 'service' | 'package' | 'api' | 'docker';
-  source: string; // file where dependency was found
+  source: string; 
   confidence: 'high' | 'medium' | 'low';
 }
 
@@ -25,22 +24,67 @@ interface ServiceNode {
   dependencies: ServiceDependency[];
 }
 
+interface AnalyzerConfig {
+  customServicePatterns?: RegExp[];
+  fileProcessingLimit?: number;
+  rateLimitDelay?: number;
+  cacheEnabled?: boolean;
+  cacheDuration?: number; 
+  debugMode?: boolean;
+}
+
 class GitHubServiceAnalyzer {
   private octokit: Octokit;
   private org: string;
   private servicePatterns: RegExp[];
+  private config: AnalyzerConfig;
+  private cache: Map<string, { data: any; timestamp: number }>;
 
-  constructor(token: string, organization: string) {
+  constructor(token: string, organization: string, config: AnalyzerConfig = {}) {
     this.octokit = new Octokit({ auth: token });
     this.org = organization;
+    this.config = {
+      fileProcessingLimit: 50,
+      rateLimitDelay: 1000,
+      cacheEnabled: true,
+      cacheDuration: 3600000, 
+      debugMode: false,
+      ...config
+    };
+    this.cache = new Map();
     
-    // Common patterns for service references
     this.servicePatterns = [
-      /https?:\/\/([a-zA-Z0-9-]+)\.([a-zA-Z0-9-]+)\.internal/g, // internal.company.com
-      /service[:-]\s*([a-zA-Z0-9-]+)/gi, // service: auth-service
-      /depends_on[:-]\s*\[?([^\]]+)\]?/gi, // depends_on: [auth, user]
-      /@([a-zA-Z0-9-]+)\/([a-zA-Z0-9-]+)/g, // @company/service-name
+      /https?:\/\/([a-zA-Z0-9-]+)\.([a-zA-Z0-9-]+)\.internal/g,
+      /service[:-]\s*([a-zA-Z0-9-]+)/gi,
+      /depends_on[:-]\s*\[?([^\]]+)\]?/gi,
+      /@([a-zA-Z0-9-]+)\/([a-zA-Z0-9-]+)/g,
+      /([a-zA-Z0-9-]+)\.service\./gi,
+      /([a-zA-Z0-9-]+)\.api\./gi,
+      /([a-zA-Z0-9-]+)\.internal/gi,
+      ...(config.customServicePatterns || [])
     ];
+  }
+
+  private log(message: string, level: 'info' | 'debug' | 'warn' | 'error' = 'info') {
+    if (this.config.debugMode || level !== 'debug') {
+      console.log(`[${level.toUpperCase()}] ${message}`);
+    }
+  }
+
+  private async getCached<T>(key: string, fetchFn: () => Promise<T>): Promise<T> {
+    if (!this.config.cacheEnabled) {
+      return fetchFn();
+    }
+
+    const cached = this.cache.get(key);
+    if (cached && Date.now() - cached.timestamp < this.config.cacheDuration!) {
+      this.log(`Cache hit for ${key}`, 'debug');
+      return cached.data;
+    }
+
+    const data = await fetchFn();
+    this.cache.set(key, { data, timestamp: Date.now() });
+    return data;
   }
 
   async analyzeOrganization(): Promise<DependencyGraph> {
@@ -51,7 +95,6 @@ class GitHubServiceAnalyzer {
     
     const allDependencies: ServiceDependency[] = [];
     
-    // Process repositories in batches to avoid rate limits
     const batchSize = 10;
     for (let i = 0; i < repositories.length; i += batchSize) {
       const batch = repositories.slice(i, i + batchSize);
@@ -67,7 +110,6 @@ class GitHubServiceAnalyzer {
       const batchResults = await Promise.all(batchPromises);
       allDependencies.push(...batchResults.flat());
       
-      // Rate limiting courtesy pause
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
@@ -95,35 +137,39 @@ class GitHubServiceAnalyzer {
   }
 
   private async analyzeRepository(repoName: string): Promise<ServiceDependency[]> {
-    console.log(`🔍 Analyzing ${repoName}...`);
+    this.log(`Analyzing ${repoName}...`, 'debug');
     const dependencies: ServiceDependency[] = [];
     
     try {
-      // Get repository file tree
-      const tree = await this.octokit.rest.git.getTree({
-        owner: this.org,
-        repo: repoName,
-        tree_sha: 'HEAD',
-        recursive: 'true'
-      });
+      const tree = await this.getCached(
+        `tree:${repoName}`,
+        () => this.octokit.rest.git.getTree({
+          owner: this.org,
+          repo: repoName,
+          tree_sha: 'HEAD',
+          recursive: 'true'
+        })
+      );
 
-      // Focus on key configuration files
       const relevantFiles = tree.data.tree.filter(item => 
         item.type === 'blob' && this.isRelevantFile(item.path || '')
       );
 
-      // Analyze each relevant file
-      for (const file of relevantFiles.slice(0, 20)) { // Limit to avoid rate limits
+      const fileLimit = this.config.fileProcessingLimit || 50;
+      for (const file of relevantFiles.slice(0, fileLimit)) {
         try {
-          const content = await this.getFileContent(repoName, file.path!);
+          const content = await this.getCached(
+            `content:${repoName}:${file.path}`,
+            () => this.getFileContent(repoName, file.path!)
+          );
           const fileDependencies = this.extractDependencies(repoName, file.path!, content);
           dependencies.push(...fileDependencies);
         } catch (err) {
-          console.warn(`⚠️  Could not read ${file.path} in ${repoName}`);
+          this.log(`Could not read ${file.path} in ${repoName}`, 'warn');
         }
       }
     } catch (error) {
-      console.warn(`⚠️  Could not access repository ${repoName}`);
+      this.log(`Could not access repository ${repoName}`, 'error');
     }
 
     return dependencies;
@@ -163,7 +209,6 @@ class GitHubServiceAnalyzer {
   private extractDependencies(repoName: string, filePath: string, content: string): ServiceDependency[] {
     const dependencies: ServiceDependency[] = [];
     
-    // Parse different file types
     if (filePath.endsWith('.json')) {
       dependencies.push(...this.parsePackageJson(repoName, filePath, content));
     } else if (filePath.match(/\.ya?ml$/)) {
@@ -174,7 +219,6 @@ class GitHubServiceAnalyzer {
       dependencies.push(...this.parseCargoToml(repoName, filePath, content));
     }
     
-    // Generic pattern matching for all files
     dependencies.push(...this.parseGenericPatterns(repoName, filePath, content));
     
     return dependencies;
@@ -232,7 +276,6 @@ class GitHubServiceAnalyzer {
             });
           }
           
-          // External services referenced in environment or image
           if ((serviceConfig as any)?.environment) {
             const envVars = (serviceConfig as any).environment;
             for (const [key, value] of Object.entries(envVars)) {
@@ -250,7 +293,6 @@ class GitHubServiceAnalyzer {
         }
       }
       
-      // Kubernetes resources
       if (doc?.spec?.containers) {
         doc.spec.containers.forEach((container: any) => {
           if (container.image && container.image.includes(this.org)) {
@@ -265,7 +307,6 @@ class GitHubServiceAnalyzer {
         });
       }
     } catch (e) {
-      // Invalid YAML or structure, fall back to text parsing
     }
     
     return dependencies;
@@ -294,7 +335,6 @@ class GitHubServiceAnalyzer {
   private parseCargoToml(repoName: string, filePath: string, content: string): ServiceDependency[] {
     const dependencies: ServiceDependency[] = [];
     
-    // Simple TOML parsing for dependencies section
     const lines = content.split('\n');
     let inDependenciesSection = false;
     
@@ -310,7 +350,6 @@ class GitHubServiceAnalyzer {
       
       if (inDependenciesSection && line.includes('=')) {
         const [depName] = line.split('=').map(s => s.trim());
-        // Look for internal crates
         if (depName.includes(this.org) || line.includes('git =')) {
           dependencies.push({
             consumer: repoName,
@@ -370,7 +409,6 @@ class GitHubServiceAnalyzer {
     const services = new Map<string, ServiceNode>();
     
     dependencies.forEach(dep => {
-      // Initialize producer service node
       if (!services.has(dep.producer)) {
         services.set(dep.producer, {
           name: dep.producer,
@@ -382,12 +420,10 @@ class GitHubServiceAnalyzer {
       
       const serviceNode = services.get(dep.producer)!;
       
-      // Add consumer if not already present
       if (!serviceNode.consumers.includes(dep.consumer)) {
         serviceNode.consumers.push(dep.consumer);
       }
       
-      // Add producer repository if it's in our org
       if (repositories.includes(dep.producer) && !serviceNode.producers.includes(dep.producer)) {
         serviceNode.producers.push(dep.producer);
       }
@@ -398,44 +434,55 @@ class GitHubServiceAnalyzer {
     return { services, repositories };
   }
 
-  async generateReport(graph: DependencyGraph): Promise<string> {
-    let report = `# Service Dependency Analysis Report\n\n`;
-    report += `**Organization:** ${this.org}\n`;
-    report += `**Total Repositories:** ${graph.repositories.length}\n`;
-    report += `**Services Identified:** ${graph.services.size}\n`;
-    report += `**Analysis Date:** ${new Date().toISOString()}\n\n`;
+  async generateReport(graph: DependencyGraph): Promise<{ markdown: string; json: string }> {
+    const markdown = await this.generateMarkdownReport(graph);
+    const json = JSON.stringify(graph, null, 2);
+    
+    await fs.writeFile('dependency-report.md', markdown);
+    await fs.writeFile('dependency-graph.json', json);
+    
+    return { markdown, json };
+  }
+
+  private async generateMarkdownReport(graph: DependencyGraph): Promise<string> {
+    const highImpactServices = Array.from(graph.services.entries())
+      .filter(([_, service]) => service.consumers.length > 5)
+      .sort(([_, a], [__, b]) => b.consumers.length - a.consumers.length);
+
+    let report = `# Dependency Analysis Report for ${this.org}\n\n`;
+    report += `Generated on: ${new Date().toISOString()}\n\n`;
     
     report += `## High-Impact Services\n\n`;
-    const sortedServices = Array.from(graph.services.entries())
-      .sort(([,a], [,b]) => b.consumers.length - a.consumers.length);
-    
-    sortedServices.slice(0, 10).forEach(([serviceName, service]) => {
-      report += `### ${serviceName}\n`;
+    for (const [name, service] of highImpactServices) {
+      report += `### ${name}\n`;
       report += `- **Consumer Count:** ${service.consumers.length}\n`;
       report += `- **Consumers:** ${service.consumers.join(', ')}\n`;
-      if (service.producers.length > 0) {
-        report += `- **Produced by:** ${service.producers.join(', ')}\n`;
-      }
-      report += `\n`;
-    });
-    
-    report += `## Detailed Dependencies\n\n`;
-    graph.services.forEach((service, serviceName) => {
-      if (service.consumers.length > 0) {
-        report += `**${serviceName}** is consumed by:\n`;
-        service.consumers.forEach(consumer => {
-          const deps = service.dependencies.filter(d => d.consumer === consumer);
-          report += `- ${consumer} (${deps.length} references)\n`;
-        });
-        report += `\n`;
-      }
-    });
+      report += `- **Produced by:** ${service.producers.join(', ')}\n\n`;
+    }
+
+    report += `## Repository Statistics\n\n`;
+    report += `- Total Repositories: ${graph.repositories.length}\n`;
+    report += `- Services with Dependencies: ${graph.services.size}\n`;
     
     return report;
   }
+
+  filterByConfidence(dependencies: ServiceDependency[], confidence: 'high' | 'medium' | 'low'): ServiceDependency[] {
+    return dependencies.filter(dep => dep.confidence === confidence);
+  }
+
+  filterByType(dependencies: ServiceDependency[], type: 'service' | 'package' | 'api' | 'docker'): ServiceDependency[] {
+    return dependencies.filter(dep => dep.type === type);
+  }
+
+  getHighImpactServices(graph: DependencyGraph, threshold: number = 5): Map<string, ServiceNode> {
+    return new Map(
+      Array.from(graph.services.entries())
+        .filter(([_, service]) => service.consumers.length >= threshold)
+    );
+  }
 }
 
-// Usage example
 async function main() {
   const analyzer = new GitHubServiceAnalyzer(
     process.env.GITHUB_TOKEN!,
@@ -446,9 +493,8 @@ async function main() {
     const graph = await analyzer.analyzeOrganization();
     const report = await analyzer.generateReport(graph);
     
-    // Save results
-    await fs.writeFile('dependency-report.md', report);
-    await fs.writeFile('dependency-graph.json', JSON.stringify(graph, null, 2));
+    await fs.writeFile('dependency-report.md', report.markdown);
+    await fs.writeFile('dependency-graph.json', report.json);
     
     console.log('✅ Analysis complete! Check dependency-report.md and dependency-graph.json');
   } catch (error) {
@@ -456,10 +502,8 @@ async function main() {
   }
 }
 
-// Export for use as a module
 export { GitHubServiceAnalyzer, ServiceDependency, DependencyGraph };
 
-// Run if this file is executed directly
 if (require.main === module) {
   main();
 }
