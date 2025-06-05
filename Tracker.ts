@@ -2,7 +2,23 @@ import { Octokit } from '@octokit/rest';
 import * as yaml from 'js-yaml';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import * as dotenv from 'dotenv';
+import * as cliProgress from 'cli-progress';
 
+// Load environment variables
+dotenv.config();
+
+// Validate required environment variables
+const requiredEnvVars = ['GITHUB_TOKEN', 'GITHUB_ORG'];
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingEnvVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingEnvVars.join(', '));
+  console.error('\nPlease set these variables in your .env file or environment:');
+  console.error('GITHUB_TOKEN=your_personal_access_token_here');
+  console.error('GITHUB_ORG=your_organization_name');
+  process.exit(1);
+}
 
 interface ServiceDependency {
   consumer: string; 
@@ -31,6 +47,7 @@ interface AnalyzerConfig {
   cacheEnabled?: boolean;
   cacheDuration?: number; 
   debugMode?: boolean;
+  targetRepos?: string[];
 }
 
 class GitHubServiceAnalyzer {
@@ -39,6 +56,7 @@ class GitHubServiceAnalyzer {
   private servicePatterns: RegExp[];
   private config: AnalyzerConfig;
   private cache: Map<string, { data: any; timestamp: number }>;
+  private progressBar: cliProgress.SingleBar;
 
   constructor(token: string, organization: string, config: AnalyzerConfig = {}) {
     this.octokit = new Octokit({ auth: token });
@@ -48,10 +66,17 @@ class GitHubServiceAnalyzer {
       rateLimitDelay: 1000,
       cacheEnabled: true,
       cacheDuration: 3600000, 
-      debugMode: false,
+      debugMode: true,
+      targetRepos: [],
       ...config
     };
     this.cache = new Map();
+    this.progressBar = new cliProgress.SingleBar({
+      format: 'Progress |{bar}| {percentage}% | {value}/{total} Files | {title}',
+      barCompleteChar: '\u2588',
+      barIncompleteChar: '\u2591',
+      hideCursor: true
+    });
     
     this.servicePatterns = [
       /https?:\/\/([a-zA-Z0-9-]+)\.([a-zA-Z0-9-]+)\.internal/g,
@@ -61,6 +86,38 @@ class GitHubServiceAnalyzer {
       /([a-zA-Z0-9-]+)\.service\./gi,
       /([a-zA-Z0-9-]+)\.api\./gi,
       /([a-zA-Z0-9-]+)\.internal/gi,
+      
+      /path\s*=\s*["']\.\.\/([^"']+)["']/g,
+      /git\s*=\s*["']https:\/\/github\.com\/[^"']+\/([^"']+)["']/g,
+      /([a-zA-Z0-9-]+)\s*=\s*\{[^}]*version\s*=\s*["'][^"']+["']/g,
+      
+      /image:\s*([a-zA-Z0-9-]+\/[a-zA-Z0-9-]+)/g,
+      /imagePullPolicy:\s*([a-zA-Z0-9-]+)/g,
+      /host:\s*([a-zA-Z0-9-]+\.[a-zA-Z0-9-]+)/g,
+      
+      /serviceName:\s*([a-zA-Z0-9-]+)/g,
+      /endpoint:\s*([a-zA-Z0-9-]+)/g,
+      /hostname:\s*([a-zA-Z0-9-]+)/g,
+      /([a-zA-Z0-9-]+)_SERVICE/g,
+      /([a-zA-Z0-9-]+)_HOST/g,
+      /([a-zA-Z0-9-]+)_PORT/g,
+      
+      /pallet_([a-zA-Z0-9-]+)/g,
+      /runtime_([a-zA-Z0-9-]+)/g,
+      /([a-zA-Z0-9-]+)_runtime/g,
+      /([a-zA-Z0-9-]+)_chain/g,
+      /([a-zA-Z0-9-]+)_node/g,
+      
+      /\.rs$/,
+      /\.toml$/,
+      /runtime\./i,
+      /chain_spec\./i,
+      /node\./i,
+      /pallet\./i,
+      /\.lock$/,
+      /build\./i,
+      /\.config\./i,
+      
       ...(config.customServicePatterns || [])
     ];
   }
@@ -93,12 +150,20 @@ class GitHubServiceAnalyzer {
     const repositories = await this.getAllRepositories();
     console.log(`📦 Found ${repositories.length} repositories`);
     
+    // Filter repositories if targetRepos is specified
+    const reposToAnalyze = this.config.targetRepos?.length 
+      ? repositories.filter(r => this.config.targetRepos!.includes(r.name))
+      : repositories;
+    
+    console.log(`🎯 Analyzing ${reposToAnalyze.length} repositories`);
+    
     const allDependencies: ServiceDependency[] = [];
     
-    const batchSize = 10;
-    for (let i = 0; i < repositories.length; i += batchSize) {
-      const batch = repositories.slice(i, i + batchSize);
-      console.log(`🔄 Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(repositories.length/batchSize)}`);
+    const batchSize = 5; // Reduced batch size for better progress tracking
+    for (let i = 0; i < reposToAnalyze.length; i += batchSize) {
+      const batch = reposToAnalyze.slice(i, i + batchSize);
+      console.log(`\n🔄 Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(reposToAnalyze.length/batchSize)}`);
+      console.log(`   Repositories: ${batch.map(r => r.name).join(', ')}`);
       
       const batchPromises = batch.map(repo => 
         this.analyzeRepository(repo.name).catch(err => {
@@ -108,12 +173,17 @@ class GitHubServiceAnalyzer {
       );
       
       const batchResults = await Promise.all(batchPromises);
-      allDependencies.push(...batchResults.flat());
+      const newDependencies = batchResults.flat();
+      allDependencies.push(...newDependencies);
       
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      console.log(`   ✅ Found ${newDependencies.length} dependencies in this batch`);
+      
+      // Rate limiting courtesy pause
+      await new Promise(resolve => setTimeout(resolve, this.config.rateLimitDelay));
     }
 
-    return this.buildDependencyGraph(allDependencies, repositories.map(r => r.name));
+    console.log(`\n📊 Analysis complete. Found ${allDependencies.length} total dependencies.`);
+    return this.buildDependencyGraph(allDependencies, reposToAnalyze.map(r => r.name));
   }
 
   private async getAllRepositories() {
@@ -137,26 +207,102 @@ class GitHubServiceAnalyzer {
   }
 
   private async analyzeRepository(repoName: string): Promise<ServiceDependency[]> {
-    this.log(`Analyzing ${repoName}...`, 'debug');
+    console.log(`\n📦 Analyzing ${repoName}...`);
     const dependencies: ServiceDependency[] = [];
     
     try {
-      const tree = await this.getCached(
-        `tree:${repoName}`,
-        () => this.octokit.rest.git.getTree({
+      // Get repository details first
+      const repoDetails = await this.octokit.rest.repos.get({
+        owner: this.org,
+        repo: repoName
+      });
+      
+      console.log(`   - Language: ${repoDetails.data.language || 'Not specified'}`);
+      console.log(`   - Size: ${Math.round(repoDetails.data.size / 1024)}MB`);
+      
+      // Get only the root tree first
+      const rootTree = await this.octokit.rest.git.getTree({
+        owner: this.org,
+        repo: repoName,
+        tree_sha: 'HEAD',
+        recursive: 'false'
+      });
+      
+      // Find relevant directories
+      const relevantDirs = rootTree.data.tree
+        .filter(item => item.type === 'tree' && (
+          item.path === 'src' ||
+          item.path === 'runtime' ||
+          item.path === 'pallets' ||
+          item.path === 'node' ||
+          item.path === 'scripts' ||
+          item.path === 'docker' ||
+          item.path === 'config'
+        ));
+      
+      console.log(`   - Found ${relevantDirs.length} relevant directories`);
+      
+      // Process each relevant directory
+      for (const dir of relevantDirs) {
+        console.log(`   - Processing ${dir.path}/...`);
+        const dirTree = await this.octokit.rest.git.getTree({
           owner: this.org,
           repo: repoName,
-          tree_sha: 'HEAD',
+          tree_sha: dir.sha!,
           recursive: 'true'
-        })
-      );
-
-      const relevantFiles = tree.data.tree.filter(item => 
+        });
+        
+        const relevantFiles = dirTree.data.tree.filter(item => 
+          item.type === 'blob' && this.isRelevantFile(item.path || '')
+        );
+        
+        console.log(`     Found ${relevantFiles.length} relevant files`);
+        
+        const fileLimit = this.config.fileProcessingLimit || 100;
+        const filesToProcess = relevantFiles.slice(0, fileLimit);
+        
+        // Initialize progress bar for this directory
+        this.progressBar.start(filesToProcess.length, 0, { title: dir.path });
+        
+        for (let i = 0; i < filesToProcess.length; i++) {
+          const file = filesToProcess[i];
+          try {
+            const content = await this.getCached(
+              `content:${repoName}:${file.path}`,
+              () => this.getFileContent(repoName, file.path!)
+            );
+            const fileDependencies = this.extractDependencies(repoName, file.path!, content);
+            dependencies.push(...fileDependencies);
+            
+            if (this.config.debugMode) {
+              console.log(`\n     - ${file.path}: Found ${fileDependencies.length} dependencies`);
+            }
+          } catch (err) {
+            if (this.config.debugMode) {
+              console.log(`\n     - Could not read ${file.path}`);
+            }
+          }
+          
+          // Update progress bar
+          this.progressBar.update(i + 1, { title: `${dir.path}/${file.path}` });
+        }
+        
+        // Stop progress bar for this directory
+        this.progressBar.stop();
+      }
+      
+      // Also check root level config files
+      const rootFiles = rootTree.data.tree.filter(item => 
         item.type === 'blob' && this.isRelevantFile(item.path || '')
       );
-
-      const fileLimit = this.config.fileProcessingLimit || 50;
-      for (const file of relevantFiles.slice(0, fileLimit)) {
+      
+      console.log(`   - Processing ${rootFiles.length} root level config files`);
+      
+      // Initialize progress bar for root files
+      this.progressBar.start(rootFiles.length, 0, { title: 'root' });
+      
+      for (let i = 0; i < rootFiles.length; i++) {
+        const file = rootFiles[i];
         try {
           const content = await this.getCached(
             `content:${repoName}:${file.path}`,
@@ -164,33 +310,67 @@ class GitHubServiceAnalyzer {
           );
           const fileDependencies = this.extractDependencies(repoName, file.path!, content);
           dependencies.push(...fileDependencies);
+          
+          if (this.config.debugMode) {
+            console.log(`\n     - ${file.path}: Found ${fileDependencies.length} dependencies`);
+          }
         } catch (err) {
-          this.log(`Could not read ${file.path} in ${repoName}`, 'warn');
+          if (this.config.debugMode) {
+            console.log(`\n     - Could not read ${file.path}`);
+          }
         }
+        
+        // Update progress bar
+        this.progressBar.update(i + 1, { title: file.path });
       }
-    } catch (error) {
-      this.log(`Could not access repository ${repoName}`, 'error');
+      
+      // Stop progress bar for root files
+      this.progressBar.stop();
+      
+    } catch (error: any) {
+      console.error(`   ❌ Error analyzing ${repoName}:`, error.message);
     }
-
+    
+    console.log(`   ✅ Found ${dependencies.length} total dependencies in ${repoName}`);
     return dependencies;
   }
 
   private isRelevantFile(filePath: string): boolean {
+    // Skip files in certain directories
+    if (filePath.includes('/target/') || 
+        filePath.includes('/node_modules/') ||
+        filePath.includes('/.git/') ||
+        filePath.includes('/.github/')) {
+      return false;
+    }
+
     const relevantPatterns = [
-      /docker-compose\.ya?ml$/,
-      /\.ya?ml$/, // Kubernetes, configs
-      /package\.json$/,
-      /Cargo\.toml$/,
-      /go\.mod$/,
-      /requirements\.txt$/,
-      /Dockerfile$/,
-      /\.env/,
-      /config\./,
-      /service\./,
-      /api\./,
+      // Configuration files
+      /^Cargo\.toml$/,  // Root Cargo.toml
+      /^docker-compose\.ya?ml$/,
+      /^\.env$/,
+      /^config\.ya?ml$/,
+      
+      // Rust specific
+      /^runtime\/.*\.rs$/,  // Runtime files
+      /^pallets\/.*\/Cargo\.toml$/,  // Pallet Cargo.toml files
+      /^pallets\/.*\/lib\.rs$/,  // Pallet lib files
+      
+      // Docker/Kubernetes
+      /^docker\/.*\.ya?ml$/,
+      /^docker\/.*Dockerfile$/,
+      
+      // Build and config
+      /^\.cargo\/config\.toml$/,
+      /^scripts\/.*\.sh$/,
+      /^scripts\/.*\.py$/,
+      
+      // Documentation with potential service references
+      /^README\.md$/,
+      /^docs\/.*\.md$/
     ];
     
-    return relevantPatterns.some(pattern => pattern.test(filePath.toLowerCase()));
+    return relevantPatterns.some(pattern => pattern.test(filePath));
   }
 
   private async getFileContent(repoName: string, filePath: string): Promise<string> {
@@ -481,24 +661,52 @@ class GitHubServiceAnalyzer {
         .filter(([_, service]) => service.consumers.length >= threshold)
     );
   }
+
+  async checkRateLimit() {
+    const rateLimit = await this.octokit.rest.rateLimit.get();
+    return {
+      remaining: rateLimit.data.resources.core.remaining,
+      reset: new Date(rateLimit.data.resources.core.reset * 1000).toLocaleString()
+    };
+  }
 }
 
 async function main() {
+  const config: AnalyzerConfig = {
+    fileProcessingLimit: parseInt(process.env.FILE_PROCESSING_LIMIT || '100'),
+    rateLimitDelay: parseInt(process.env.RATE_LIMIT_DELAY || '1000'),
+    cacheEnabled: process.env.CACHE_ENABLED !== 'false',
+    cacheDuration: parseInt(process.env.CACHE_DURATION || '3600000'),
+    debugMode: true,
+    targetRepos: ['polkadot-sdk']
+  };
+
   const analyzer = new GitHubServiceAnalyzer(
     process.env.GITHUB_TOKEN!,
-    process.env.GITHUB_ORG!
+    process.env.GITHUB_ORG!,
+    config
   );
   
   try {
+    console.log(`🔍 Starting analysis of ${process.env.GITHUB_ORG} organization...`);
+    console.log(`📦 Focusing on repository: ${config.targetRepos![0]}`);
+    
+    // Add rate limit check
+    const rateLimit = await analyzer.checkRateLimit();
+    console.log(`\n📊 Current GitHub API Status:`);
+    console.log(`   - Remaining requests: ${rateLimit.remaining}`);
+    console.log(`   - Reset time: ${rateLimit.reset}`);
+    
     const graph = await analyzer.analyzeOrganization();
     const report = await analyzer.generateReport(graph);
     
     await fs.writeFile('dependency-report.md', report.markdown);
     await fs.writeFile('dependency-graph.json', report.json);
     
-    console.log('✅ Analysis complete! Check dependency-report.md and dependency-graph.json');
+    console.log('\n✅ Analysis complete! Check dependency-report.md and dependency-graph.json');
   } catch (error) {
     console.error('❌ Analysis failed:', error);
+    process.exit(1);
   }
 }
 
